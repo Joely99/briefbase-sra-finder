@@ -1,7 +1,7 @@
 # main.py
 import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import requests
 from dotenv import load_dotenv
@@ -11,12 +11,16 @@ from fastapi.middleware.cors import CORSMiddleware
 # ---------- config / secrets ----------
 load_dotenv()
 
-SRA_API_KEY = os.getenv("SRA_API_KEY")  # add in Replit → Tools → Secrets
-# Use Azure API Management hostname (avoids SSL glitch on microsites host)
-BASE_URL = "https://sra-prod-api.microsites.uk/datashare/api/v1"
+SRA_API_KEY = os.getenv("SRA_API_KEY")  # set this on Render (Environment) or locally in .env
+
+# Try both official SRA hosts; we’ll fall back automatically if one can’t be reached
+SRA_HOSTS = [
+    "https://sra-prod-api.azure-api.net/datashare/api/v1",   # APIM (preferred)
+    "https://sra-prod-api.microsites.uk/datashare/api/v1",  # Microsites (fallback)
+]
 
 if not SRA_API_KEY:
-    raise RuntimeError("Missing SRA_API_KEY. Add it in Replit → Tools → Secrets.")
+    raise RuntimeError("Missing SRA_API_KEY. Add it on Render → Environment (or in .env locally).")
 
 HEADERS = {
     "Ocp-Apim-Subscription-Key": SRA_API_KEY,
@@ -24,9 +28,9 @@ HEADERS = {
 }
 
 # ---------- app ----------
-app = FastAPI(title="BriefBase SRA Finder", version="0.2.0")
+app = FastAPI(title="BriefBase SRA Finder", version="0.3.0")
 
-# open CORS for testing (tighten later to your domain)
+# open CORS for testing (tighten later to your allowed frontend origin)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,24 +54,32 @@ UK_PC_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+
 def normalise_postcode(pc: str) -> str:
     """Uppercase & collapse spaces/punct to aid comparisons."""
     pc = (pc or "").upper()
     pc = re.sub(r"\s+", " ", pc).strip()
     return pc
 
+
 def outward_code(pc: str) -> str:
-    """Return outward part (everything before the space) or last 3 chars as fallback."""
+    """
+    Return the outward part (before the space). If no space present,
+    return everything except the last 3 chars as a best-effort fallback.
+    """
     pc = normalise_postcode(pc)
     if " " in pc:
         return pc.split(" ", 1)[0]
-    # fallback: many APIs still work if we use everything except inward last 3
     return pc[:-3] if len(pc) > 3 else pc
+
 
 def looks_active(org: Dict[str, Any]) -> bool:
     """Treat common SRA statuses as 'active'."""
     status = (org.get("AuthorisationStatus") or "").strip().lower()
-    return any(w in status for w in ["authorised", "registered", "authorised body", "recognised body"])
+    return any(w in status for w in [
+        "authorised", "registered", "authorised body", "recognised body"
+    ])
+
 
 def office_matches_postcode(office: Dict[str, Any], target_pc: str) -> bool:
     """Check if any office address outward code matches user's outward code."""
@@ -77,29 +89,44 @@ def office_matches_postcode(office: Dict[str, Any], target_pc: str) -> bool:
         return False
     return outward_code(pc) == outward_code(target_pc)
 
+
 def call_sra_json(path: str, *, timeout: int = 20) -> Dict[str, Any]:
-    url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.HTTPError as e:
-        raise HTTPException(status_code=resp.status_code, detail=f"SRA API HTTP error: {e}")  # type: ignore
-    except requests.exceptions.SSLError as e:
-        # Specific hint if someone flips host back to microsites (SNI issue)
-        raise HTTPException(status_code=502, detail=f"SRA API SSL error: {e}. "
-                                                    f"Make sure BASE_URL uses azure-api.net.")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"SRA API network error: {e}")
+    """
+    GET {host}/{path} against the SRA API.
+    Tries both APIM and microsites hostnames; returns JSON from the first success.
+    Raises HTTPException(502) with the last error if both fail.
+    """
+    last_status = None
+    last_msg = None
+
+    for base in SRA_HOSTS:
+        url = f"{base.rstrip('/')}/{path.lstrip('/')}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last_status = resp.status_code if "resp" in locals() else 502
+            last_msg = f"SRA API HTTP error from {base}: {e}"
+        except requests.exceptions.RequestException as e:
+            # DNS failures, timeouts, connection errors, SSL errors, etc.
+            last_status = 502
+            last_msg = f"SRA API network error from {base}: {e}"
+
+    # If we got here, both hosts failed
+    raise HTTPException(status_code=last_status or 502, detail=last_msg or "SRA upstream error")
+
 
 # ---------- endpoints ----------
 @app.get("/", summary="Root")
 def root():
     return {"ok": True, "msg": "FastAPI is alive."}
 
+
 @app.get("/health", summary="Health")
 def health():
     return {"status": "ok"}
+
 
 @app.get(
     "/search",
@@ -141,4 +168,3 @@ def search_firms(
                 break  # one matching office is enough
 
     return {"count": len(results), "results": results}
-
