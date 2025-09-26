@@ -13,7 +13,7 @@ load_dotenv()
 
 SRA_API_KEY = os.getenv("SRA_API_KEY")  # add in Replit → Tools → Secrets
 # Use Azure API Management hostname (avoids SSL glitch on microsites host)
-BASE_URL = "https://sra-prod-api.azure-api.net/datashare/api/v1"
+BASE_URL = "https://sra-prod-api.microsites.uk/datashare/api/v1"
 
 if not SRA_API_KEY:
     raise RuntimeError("Missing SRA_API_KEY. Add it in Replit → Tools → Secrets.")
