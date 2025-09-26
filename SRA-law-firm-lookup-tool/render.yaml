@@ -2,13 +2,10 @@ services:
   - type: web
     name: briefbase-sra-finder
     env: python
+    rootDir: SRA-law-firm-lookup-tool
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
-    healthCheckPath: /health
-    plan: free
-    region: oregon
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
     envVars:
       - key: SRA_API_KEY
-        sync: false  # set this in Render's dashboard after deploy
-      - key: USE_MOCK
-        sync: false  # optional: set to '1' to use mock mode for testing
+        sync: false
