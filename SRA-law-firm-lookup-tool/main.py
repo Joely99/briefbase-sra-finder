@@ -11,16 +11,16 @@ from fastapi.middleware.cors import CORSMiddleware
 # ---------- config / secrets ----------
 load_dotenv()
 
-SRA_API_KEY = os.getenv("SRA_API_KEY")  # set this on Render (Environment) or locally in .env
+SRA_API_KEY = os.getenv("SRA_API_KEY")
 
-# Try both official SRA hosts; we’ll fall back automatically if one can’t be reached
+# On Render, azure-api.net DNS can be flaky; try microsites first, then azure-api.
 SRA_HOSTS = [
-    "https://sra-prod-api.azure-api.net/datashare/api/v1",   # APIM (preferred)
-    "https://sra-prod-api.microsites.uk/datashare/api/v1",  # Microsites (fallback)
+    "https://sra-prod-api.microsites.uk/datashare/api/v1",
+    "https://sra-prod-api.azure-api.net/datashare/api/v1",
 ]
 
 if not SRA_API_KEY:
-    raise RuntimeError("Missing SRA_API_KEY. Add it on Render → Environment (or in .env locally).")
+    raise RuntimeError("Missing SRA_API_KEY. Set it in Render → Environment.")
 
 HEADERS = {
     "Ocp-Apim-Subscription-Key": SRA_API_KEY,
@@ -30,7 +30,7 @@ HEADERS = {
 # ---------- app ----------
 app = FastAPI(title="BriefBase SRA Finder", version="0.3.0")
 
-# open CORS for testing (tighten later to your allowed frontend origin)
+# Open CORS during testing (tighten later to your domain)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,51 +54,36 @@ UK_PC_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-
 def normalise_postcode(pc: str) -> str:
-    """Uppercase & collapse spaces/punct to aid comparisons."""
     pc = (pc or "").upper()
     pc = re.sub(r"\s+", " ", pc).strip()
     return pc
 
-
 def outward_code(pc: str) -> str:
-    """
-    Return the outward part (before the space). If no space present,
-    return everything except the last 3 chars as a best-effort fallback.
-    """
     pc = normalise_postcode(pc)
     if " " in pc:
         return pc.split(" ", 1)[0]
     return pc[:-3] if len(pc) > 3 else pc
 
-
 def looks_active(org: Dict[str, Any]) -> bool:
-    """Treat common SRA statuses as 'active'."""
     status = (org.get("AuthorisationStatus") or "").strip().lower()
     return any(w in status for w in [
         "authorised", "registered", "authorised body", "recognised body"
     ])
 
-
 def office_matches_postcode(office: Dict[str, Any], target_pc: str) -> bool:
-    """Check if any office address outward code matches user's outward code."""
     addrs = office.get("Address", {}) or {}
     pc = addrs.get("PostCode") or ""
     if not pc:
         return False
     return outward_code(pc) == outward_code(target_pc)
 
-
 def call_sra_json(path: str, *, timeout: int = 20) -> Dict[str, Any]:
     """
-    GET {host}/{path} against the SRA API.
-    Tries both APIM and microsites hostnames; returns JSON from the first success.
-    Raises HTTPException(502) with the last error if both fail.
+    Try each base host in order; return the first successful JSON.
+    If all fail, surface the last error.
     """
-    last_status = None
-    last_msg = None
-
+    last_error = None
     for base in SRA_HOSTS:
         url = f"{base.rstrip('/')}/{path.lstrip('/')}"
         try:
@@ -106,27 +91,46 @@ def call_sra_json(path: str, *, timeout: int = 20) -> Dict[str, Any]:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
-            last_status = resp.status_code if "resp" in locals() else 502
-            last_msg = f"SRA API HTTP error from {base}: {e}"
+            # HTTP error with a response (e.g., 401/403/5xx)
+            try:
+                detail = resp.text[:500]  # type: ignore
+            except Exception:
+                detail = str(e)
+            last_error = f"HTTPError on {base}: {detail}"
+        except requests.exceptions.SSLError as e:
+            last_error = f"SSLError on {base}: {e}"
         except requests.exceptions.RequestException as e:
-            # DNS failures, timeouts, connection errors, SSL errors, etc.
-            last_status = 502
-            last_msg = f"SRA API network error from {base}: {e}"
-
-    # If we got here, both hosts failed
-    raise HTTPException(status_code=last_status or 502, detail=last_msg or "SRA upstream error")
-
+            last_error = f"Network error on {base}: {e}"
+        # Try next base
+    raise HTTPException(status_code=502, detail=f"SRA API network error: {last_error}")
 
 # ---------- endpoints ----------
 @app.get("/", summary="Root")
 def root():
     return {"ok": True, "msg": "FastAPI is alive."}
 
-
 @app.get("/health", summary="Health")
 def health():
     return {"status": "ok"}
 
+@app.get("/probe", summary="Probe SRA hosts")
+def probe():
+    """
+    Quick diagnostic: attempts a lightweight call to each SRA host
+    and reports whether it succeeds or the error we get.
+    """
+    results = []
+    for base in SRA_HOSTS:
+        url = f"{base.rstrip('/')}/Organisations?$top=1"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            ok = r.ok
+            status = r.status_code
+            body = (r.text or "")[:300]
+            results.append({"host": base, "ok": ok, "status": status, "sample": body})
+        except Exception as e:
+            results.append({"host": base, "ok": False, "error": str(e)})
+    return {"probe": results}
 
 @app.get(
     "/search",
@@ -136,20 +140,18 @@ def health():
 def search_firms(
     postcode: str = Query(..., description="UK postcode, e.g., SW1A 1AA or SW1A1AA")
 ):
-    # basic validation to avoid junk inputs
     pc_clean = normalise_postcode(postcode)
     if not UK_PC_RE.match(pc_clean):
         raise HTTPException(status_code=422, detail="Please provide a valid UK postcode.")
 
-    # 1) Pull organisations (this payload contains offices)
+    # Pull organisations (the payload includes Offices)
     data = call_sra_json("Organisations")
 
-    # 2) Filter: active + at least one office matching outward code
+    # Filter for active orgs with at least one matching office outward code
     results: List[Dict[str, Any]] = []
     for org in data.get("value", []) or []:
         if not looks_active(org):
             continue
-
         for office in org.get("Offices", []) or []:
             if office_matches_postcode(office, pc_clean):
                 addrs = office.get("Address", {}) or {}
@@ -166,5 +168,4 @@ def search_firms(
                     }
                 )
                 break  # one matching office is enough
-
     return {"count": len(results), "results": results}
