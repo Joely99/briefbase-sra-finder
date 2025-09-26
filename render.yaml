@@ -2,9 +2,9 @@ services:
   - type: web
     name: briefbase-sra-finder
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    startCommand: bash -lc "cd SRA-law-firm-lookup-tool && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    autoDeploy: true
     envVars:
       - key: SRA_API_KEY
         sync: false
